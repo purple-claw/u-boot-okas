@@ -6,6 +6,7 @@
 
 #include <common.h>
 #include <dm.h>
+#include <env.h>
 #include <env_internal.h>
 #include <init.h>
 #include <net.h>
@@ -14,6 +15,7 @@
 #include <asm/arch/eth.h>
 #include <asm/arch/sm.h>
 #include <asm/global_data.h>
+#include <asm-generic/gpio.h>
 #include <i2c.h>
 #include "khadas-mcu.h"
 
@@ -149,12 +151,92 @@ int meson_ft_board_setup(void *blob, struct bd_info *bd)
 #define EFUSE_MAC_SIZE		12
 #define MAC_ADDR_LEN		6
 
+/*
+ * OKAS unlock mode GPIO.
+ *
+ * GPIOH_4 on S905D3 (VIM3L) is in the "periphs-banks" GPIO controller
+ * at offset 20 (GPIOH_0 starts at offset 16, so GPIOH_4 = 16 + 4 = 20).
+ *
+ * Electrical setup:
+ *   - Internal pull-down enabled (default LOW when floating)
+ *   - Jumper to 3.3V (VDDIO_H) overrides pull-down → HIGH
+ *
+ * Policy:
+ *   GPIOH_4 = 0 (Lock) → boot from eMMC only
+ *   GPIOH_4 = 1 (unlock)    → boot from USB, SD, eMMC, PXE, DHCP
+ */
+static int okas_read_unlock_gpio(void)
+{
+	struct gpio_desc desc;
+	int ret, val;
+
+	/* Look up GPIOH_4: bank "periphs-banks", offset 20 */
+	ret = dm_gpio_lookup_name("periphs-banks20", &desc);
+	if (ret) {
+		printf("[OKAS] GPIO lookup failed (%d), defaulting to Lock\n",
+		       ret);
+		return 0;
+	}
+
+	ret = dm_gpio_request(&desc, "okas_unlock");
+	if (ret) {
+		printf("[OKAS] GPIO request failed (%d), defaulting to Lock\n",
+		       ret);
+		return 0;
+	}
+
+	/* Configure as input with internal pull-down */
+	ret = dm_gpio_set_dir_flags(&desc, GPIOD_IS_IN | GPIOD_PULL_DOWN);
+	if (ret) {
+		printf("[OKAS] GPIO dir setup failed (%d), defaulting to Lock\n",
+		       ret);
+		dm_gpio_free(NULL, &desc);
+		return 0;
+	}
+
+	val = dm_gpio_get_value(&desc);
+	if (val < 0) {
+		printf("[OKAS] GPIO read failed (%d), defaulting to Lock\n",
+		       val);
+		dm_gpio_free(NULL, &desc);
+		return 0;
+	}
+
+	printf("[OKAS] GPIOH_4 = %d\n", val);
+
+	dm_gpio_free(NULL, &desc);
+	return val;
+}
+
 int misc_init_r(void)
 {
 	u8 mac_addr[MAC_ADDR_LEN + 1];
 	char efuse_mac_addr[EFUSE_MAC_SIZE], tmp[3];
 	char serial_string[EFUSE_MAC_SIZE + 1];
 	ssize_t len;
+	int unlock;
+
+	printf("\n[OKAS-SIG] VIM3L Custom U-Boot active\n");
+	unlock = okas_read_unlock_gpio();
+
+	if (unlock == 1) {
+		/*
+		 * UNLOCK MODE: stop autoboot, drop to U-Boot shell.
+		 * bootdelay=-1 tells main_loop() to skip autoboot entirely.
+		 */
+		printf("[OKAS] UNLOCK MODE: stopping autoboot, U-Boot shell enabled\n");
+		env_set("bootdelay", "-1");
+		env_set("boot_targets", "usb0 mmc1 mmc0 pxe dhcp");
+	} else {
+		/*
+		 * LOCK MODE: immediate autoboot from eMMC only.
+		 * bootdelay=0 runs bootcmd with no countdown.
+		 * boot_targets=mmc1 restricts to eMMC.
+		 */
+		printf("[OKAS] LOCK MODE: autoboot from eMMC only\n");
+		env_set("bootdelay", "0");
+		env_set("boot_targets", "mmc1");
+	}
 
 	if (!eth_env_get_enetaddr("ethaddr", mac_addr)) {
 		len = meson_sm_read_efuse(EFUSE_MAC_OFFSET,

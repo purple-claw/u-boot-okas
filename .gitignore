@@ -9,8 +9,6 @@
 !.checkpatch.conf
 *.a
 *.asn1.[ch]
-*.bin
-*.bin[_.]*
 *.cfgout
 *.cover
 *.dtb
