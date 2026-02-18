@@ -6,6 +6,7 @@
 
 #include <common.h>
 #include <dm.h>
+#include <env.h>
 #include <env_internal.h>
 #include <init.h>
 #include <net.h>
@@ -14,6 +15,7 @@
 #include <asm/arch/eth.h>
 #include <asm/arch/sm.h>
 #include <asm/global_data.h>
+#include <asm-generic/gpio.h>
 #include <i2c.h>
 #include "khadas-mcu.h"
 
@@ -149,12 +151,122 @@ int meson_ft_board_setup(void *blob, struct bd_info *bd)
 #define EFUSE_MAC_SIZE		12
 #define MAC_ADDR_LEN		6
 
+/*
+ * OKAS service mode GPIO (GPIOH_4).
+ *
+ * On S905D3 (VIM3L), GPIOH_4 is in the "periphs-banks" GPIO controller
+ * at offset 20 (GPIOH_0 = 16, so GPIOH_4 = 20).
+ *
+ * Electrical:
+ *   - Internal pull-down enabled (floating = LOW)
+ *   - Jumper to 3.3V overrides pull-down = HIGH
+ *
+ * Policy:
+ *   GPIOH_4 = 0 (LOCK)   -> bootdelay=0, boot_targets=mmc2 (eMMC only),
+ *                            no USB/SD/NVMe/network, instant OS boot.
+ *   GPIOH_4 = 1 (UNLOCK) -> bootdelay=3, boot_targets=mmc2 mmc1 mmc0
+ *                            usb0 nvme0 pxe dhcp (all media enabled),
+ *                            autoboot after 3 s countdown.
+ *
+ * In BOTH modes the system autoboots into the OS via distro_bootcmd. This is beacuse by default the system is bootlooping at the Intial Stage.
+ *
+ * IMPORTANT: Only call from misc_init_r() or later (DM must be ready).
+ */
+static int okas_read_gpioh4(void)
+{
+	struct gpio_desc desc;
+	int ret, val;
+
+	/* Look up GPIOH_4: bank "periphs-banks", offset 20 */
+	ret = dm_gpio_lookup_name("periphs-banks20", &desc);
+	if (ret) {
+		printf("[OKAS] GPIO lookup failed (%d), defaulting to LOCK\n", ret);
+		return 0;
+	}
+
+	ret = dm_gpio_request(&desc, "okas_service");
+	if (ret) {
+		printf("[OKAS] GPIO request failed (%d), defaulting to LOCK\n", ret);
+		return 0;
+	}
+
+	/* Configure as input with internal pull-down */
+	ret = dm_gpio_set_dir_flags(&desc, GPIOD_IS_IN | GPIOD_PULL_DOWN);
+	if (ret) {
+		printf("[OKAS] GPIO dir setup failed (%d), defaulting to LOCK\n", ret);
+		dm_gpio_free(NULL, &desc);
+		return 0;
+	}
+
+	val = dm_gpio_get_value(&desc);
+	if (val < 0) {
+		printf("[OKAS] GPIO read failed (%d), defaulting to LOCK\n", val);
+		dm_gpio_free(NULL, &desc);
+		return 0;
+	}
+
+	printf("[OKAS] GPIOH_4 = %d\n", val);
+	dm_gpio_free(NULL, &desc);
+	return val;
+}
+
 int misc_init_r(void)
 {
 	u8 mac_addr[MAC_ADDR_LEN + 1];
 	char efuse_mac_addr[EFUSE_MAC_SIZE], tmp[3];
 	char serial_string[EFUSE_MAC_SIZE + 1];
 	ssize_t len;
+	int unlock;
+
+	printf("\n[OKAS-SIG] VIM3L Custom U-Boot active\n");
+	unlock = okas_read_gpioh4();
+
+	if (unlock == 1) {
+		/*
+		 * UNLOCK MODE: In this mode all boot media is enabled, small delay.
+		 *
+		 * Enable USB, SD card, eMMC, NVMe, and network boot.
+		 * A 3-second bootdelay lets a developer interrupt if
+		 * needed, but autoboot still proceeds to the OS after
+		 * the countdown expires.
+		 *
+		 * "preboot=usb start" initialises the USB subsystem
+		 * BEFORE the bootdelay countdown so that:
+		 *   - USB keyboard works to interrupt autoboot
+		 *   - USB storage is visible to distro_bootcmd
+		 *   - USB gadgets / mass-storage are accessible
+		 *
+		 * Boot order: eMMC first, then SD, USB, NVMe, network.
+		 */
+		printf("[OKAS] UNLOCK MODE: Now Devs can access all boot media, bootdelay set to 3\n");
+		env_set("preboot", "usb start");
+		env_set("bootdelay", "3");
+		env_set("boot_targets", "mmc2 mmc1 mmc0 usb0 nvme0 pxe dhcp");
+	} else {
+		/*
+		 * LOCK MODE: This mode is eMMC-only, zero delay, immediate OS boot.
+		 *
+		 * Strictly enforce: no USB, no SD, no NVMe, no PXE,
+		 * no DHCP, no network — only the internal eMMC (mmc2).
+		 *
+		 * - bootdelay=0 runs bootcmd instantly, no countdown.
+		 */
+		printf("[OKAS] LOCK MODE: You have nothing to do here..! Board boots from eMMC-only\n");
+		env_set("preboot", "");
+		env_set("bootdelay", "0");
+		env_set("boot_targets", "mmc2");
+		env_set("stdin", "serial");
+		env_set("bootcmd_usb0", "");
+		env_set("bootcmd_mmc0", "");
+		env_set("bootcmd_mmc1", "");
+		env_set("bootcmd_pxe", "");
+		env_set("bootcmd_dhcp", "");
+		env_set("bootcmd_nvme0", "");
+		env_set("bootcmd_scsi0", "");
+		env_set("bootcmd_usbdfu", "");
+		env_set("usb_boot", "");
+		env_set("boot_net_usb_start", "");
+	}
 
 	if (!eth_env_get_enetaddr("ethaddr", mac_addr)) {
 		len = meson_sm_read_efuse(EFUSE_MAC_OFFSET,
