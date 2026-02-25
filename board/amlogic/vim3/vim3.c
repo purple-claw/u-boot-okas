@@ -19,6 +19,8 @@
 #include <i2c.h>
 #include "khadas-mcu.h"
 
+static int okasUnlckd; /*Global Storage point for OKAS LOcked State*/
+
 int mmc_get_env_dev(void)
 {
 	switch (meson_get_boot_device()) {
@@ -30,6 +32,116 @@ int mmc_get_env_dev(void)
 		/* boot device is not EMMC|SD */
 		return -1;
 	}
+}
+
+/*
+ * Helper: set a DT node's status to "disabled" by compatible string.
+ * Returns 0 on success, or silently returns 0 if the node doesn't exist.
+ */
+static int okas_fdt_disable_by_compat(void *blob, const char *compat,
+				      const char *label)
+{
+	int node, ret;
+	static char disabled[] = "disabled";
+
+	node = fdt_node_offset_by_compatible(blob, -1, compat);
+	if (node < 0) {
+		printf("[OKAS-LOCK] %s: node not found (ok)\n", label);
+		return 0;
+	}
+
+	ret = fdt_setprop_string(blob, node, "status", disabled);
+	if (ret < 0) {
+		printf("[OKAS-LOCK] %s: failed to disable (%d)\n", label, ret);
+		return ret;
+	}
+
+	printf("[OKAS-LOCK] %s: disabled in DT\n", label);
+	return 0;
+}
+
+/*
+ * OKAS LOCK-mode Complete FDT lockdown.
+ *
+ * Disable every peripheral such that it must be inaccessible once Linux boots:
+ *   - USB glue controller   (amlogic,meson-g12a-usb-ctrl)
+ *   - DWC3 USB host         (snps,dwc3)         -- Type-A port
+ *   - DWC2 USB gadget/OTG   (snps,dwc2)         -- USB-C port
+ *   - USB2 PHY 0            (amlogic,g12a-usb2-phy)  -- USB-C PHY
+ *   - USB2 PHY 1            (2nd instance)            -- Type-A PHY
+ *   - USB3/PCIe combo PHY   (amlogic,g12a-usb3-pcie-phy)
+ *   - SD card               (amlogic,meson-axg-mmc @ ffe05000)
+ *   - PCIe                  (amlogic,g12a-pcie)
+ *
+ * NOT disabled: eMMC, ethernet, HDMI, UART — those are needed.
+ */
+static void okas_lock_fdt(void *blob)
+{
+	int node, ret;
+
+	printf("[OKAS-LOCK] Enforcing strict port lockdown in Linux DT\n");
+
+	/* ---- USB controller (parent glue) ---- */
+	okas_fdt_disable_by_compat(blob, "amlogic,meson-g12a-usb-ctrl",
+				   "USB-ctrl");
+
+	/* ---- DWC3 USB3 host (Type-A) ---- */
+	okas_fdt_disable_by_compat(blob, "snps,dwc3", "DWC3-host");
+
+	/* ---- DWC2 USB OTG/gadget (USB-C) ---- */
+	okas_fdt_disable_by_compat(blob, "snps,dwc2", "DWC2-gadget");
+
+	/* ---- USB2 PHYs (two instances — disable both) ---- */
+	node = fdt_node_offset_by_compatible(blob, -1, "amlogic,g12a-usb2-phy");
+	while (node >= 0) {
+		ret = fdt_setprop_string(blob, node, "status", "disabled");
+		if (ret < 0)
+			printf("[OKAS-LOCK] USB2-PHY @ 0x%x: disable failed (%d)\n",
+			       node, ret);
+		else
+			printf("[OKAS-LOCK] USB2-PHY @ 0x%x: disabled\n", node);
+		node = fdt_node_offset_by_compatible(blob, node,
+						     "amlogic,g12a-usb2-phy");
+	}
+
+	/* ---- USB3/PCIe combo PHY ---- */
+	okas_fdt_disable_by_compat(blob, "amlogic,g12a-usb3-pcie-phy",
+				   "USB3-PCIe-PHY");
+
+	/* ---- SD card slot (sd_emmc_b @ ffe05000) ---- */
+	node = fdt_path_offset(blob, "/soc/mmc@ffe05000");
+	if (node < 0) {
+		/* Fallback: search by compatible, match on register address */
+		node = fdt_node_offset_by_compatible(blob, -1,
+						     "amlogic,meson-sm1-mmc");
+		while (node >= 0) {
+			const void *regp = fdt_getprop(blob, node, "reg", NULL);
+			if (regp) {
+				/*
+				 * reg is 64-bit: <hi32 lo32 ...>
+				 * Address is in the second u32 cell.
+				 */
+				u32 addr = fdt32_to_cpu(*((const u32 *)regp + 1));
+				/* ffe05000 = SD slot, ffe07000 = eMMC, ffe03000 = SDIO */
+				if (addr == 0xffe05000) {
+					fdt_setprop_string(blob, node, "status",
+							   "disabled");
+					printf("[OKAS-LOCK] SD-card (mmc@ffe05000): disabled\n");
+					break;
+				}
+			}
+			node = fdt_node_offset_by_compatible(blob, node,
+							     "amlogic,meson-sm1-mmc");
+		}
+	} else {
+		fdt_setprop_string(blob, node, "status", "disabled");
+		printf("[OKAS-LOCK] SD-card (mmc@ffe05000): disabled\n");
+	}
+
+	/* ---- PCIe ---- */
+	okas_fdt_disable_by_compat(blob, "amlogic,g12a-pcie", "PCIe");
+
+	printf("[OKAS-LOCK] DT lockdown complete — only eMMC, ethernet, HDMI remain\n");
 }
 
 /*
@@ -46,6 +158,17 @@ int meson_ft_board_setup(void *blob, struct bd_info *bd)
 	int node, i2c_node, ret;
 	unsigned int i2c_addr;
 	u32 *val;
+
+	/*
+	 * OKAS LOCK MODE: disable all ports in the Linux DT,
+	 * then return — skip the PCIe/USB mux logic entirely.
+	 */
+	if (!okasUnlckd) {
+		okas_lock_fdt(blob);
+		return 0;
+	}
+
+	/* ---- UNLOCK MODE: original PCIe/USB mux logic follows ---- */
 
 	/* Find I2C device */
 	node = fdt_node_offset_by_compatible(gd->fdt_blob, -1, "khadas,mcu");
@@ -220,6 +343,9 @@ int misc_init_r(void)
 
 	printf("\n[OKAS-SIG] VIM3L Custom U-Boot active\n");
 	unlock = okas_read_gpioh4();
+
+	/* Store globally so meson_ft_board_setup() can read it */
+	okasUnlckd = unlock;
 
 	if (unlock == 1) {
 		/*
